@@ -6,7 +6,6 @@
 use std::ops::Range;
 
 use nsh_core::prelude::*;
-
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::controller::{Span, char_columns};
