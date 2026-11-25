@@ -27,6 +27,7 @@ pub(crate) mod highlight;
 mod highlighter;
 mod hooks;
 mod keymap;
+pub(crate) mod line_break;
 pub(crate) mod language;
 pub(crate) mod languages;
 pub(crate) mod layout;

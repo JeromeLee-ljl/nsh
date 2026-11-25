@@ -7,7 +7,10 @@ use std::ops::Range;
 
 use nsh_core::prelude::*;
 
+use unicode_segmentation::UnicodeSegmentation;
+
 use super::controller::{Span, char_columns};
+use crate::editor::line_break::last_break;
 
 /// The rows' tops and their texts' heights.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -82,34 +85,57 @@ impl Geometry {
 }
 
 /// Where each wrapped line of `text` (tabs expanded) starts, in bytes, at
-/// `columns` a line: after the last whitespace that fits, else at the
-/// edge; whitespace past the edge hangs there rather than starting a line.
-/// The first is 0.
+/// `columns` a line, as the editor wraps its rows: at the last break
+/// opportunity that fits ([`last_break`]: between ASCII chars after
+/// whitespace, elsewhere where Unicode's line breaking allows), else at the
+/// edge between graphemes; never inside a grapheme, nor after the
+/// indentation alone, and whitespace past the edge hangs there rather than
+/// starting a line. The first is 0.
 pub(crate) fn wrap_starts(text: &str, columns: usize) -> Vec<usize> {
     let columns = columns.max(1);
     let mut starts = vec![0];
+    let lead = text.len() - text.trim_start_matches([' ', '\t']).len();
+    let ascii = text.is_ascii();
+    let mut line_start = 0;
     let mut count = 0;
-    // Just after the last whitespace of the current line.
+    // An ASCII line's last break opportunity: just after the last
+    // whitespace past the indentation. Other lines look for theirs when a
+    // line overflows: most fit, and pay nothing for it.
     let mut break_at: Option<usize> = None;
-    for (at, c) in text.char_indices() {
-        let blank = c.is_whitespace();
-        let width = char_columns(c);
-        if count > 0 && count + width > columns && !blank {
-            let line_start = *starts.last().unwrap_or(&0);
-            let start = match break_at {
-                Some(b) if b > line_start => b,
-                _ => at,
+    for (at, grapheme) in graphemes(text, ascii) {
+        let blank = grapheme.chars().all(char::is_whitespace);
+        let width = grapheme.chars().map(char_columns).sum::<usize>();
+        // A line may still overflow with what moved down: wrap again.
+        while !blank && at > line_start && count + width > columns {
+            let found = if ascii {
+                break_at.filter(|b| *b > line_start)
+            } else {
+                last_break(text, line_start, lead, at)
             };
+            let start = found.unwrap_or(at);
             starts.push(start);
             count = text[start..at].chars().map(char_columns).sum();
+            line_start = start;
             break_at = None;
         }
         count += width;
-        if blank {
-            break_at = Some(at + c.len_utf8());
+        if ascii && blank && at + grapheme.len() > lead {
+            break_at = Some(at + grapheme.len());
         }
     }
     starts
+}
+
+/// The graphemes of `text` with their byte offsets; in ASCII text each
+/// byte is one.
+fn graphemes(text: &str, ascii: bool) -> impl Iterator<Item = (usize, &str)> {
+    let mut bytes = ascii.then(|| (0..text.len()).map(move |at| (at, &text[at..at + 1])));
+    let mut clusters = (!ascii).then(|| text.grapheme_indices(true));
+    std::iter::from_fn(move || match (&mut bytes, &mut clusters) {
+        (Some(bytes), _) => bytes.next(),
+        (_, Some(clusters)) => clusters.next(),
+        _ => None,
+    })
 }
 
 /// How many lines `text` (tabs expanded) wraps into at `columns`.
@@ -194,6 +220,88 @@ mod tests {
         // One that would end past the edge starts the next line.
         assert_eq!(pieces("a中文", 4), vec!["a中", "文"]);
         assert_eq!(wrapped_lines("中文中文", 4), 2);
+    }
+
+    #[test]
+    fn mixed_cjk_and_latin_wraps_between_cjk_chars() {
+        // The CJK run fills the line instead of moving down whole after
+        // the space.
+        assert_eq!(pieces("ab 中文字符", 7), vec!["ab 中文", "字符"]);
+        // Latin text and CJK may break where they meet without a space.
+        assert_eq!(pieces("a Mac上没", 6), vec!["a Mac", "上没"]);
+        assert_eq!(wrapped_lines("ab 中文字符", 7), 2);
+    }
+
+    #[test]
+    fn punctuation_keeps_to_its_text() {
+        // Closing punctuation never starts a line, opening punctuation
+        // never ends one, small kana stay with the char before them.
+        assert_eq!(pieces("中文，字。", 5), vec!["中", "文，", "字。"]);
+        assert_eq!(pieces("说「你好」吧", 4), vec!["说", "「你", "好」", "吧"]);
+        assert_eq!(pieces("待ちっと", 4), vec!["待", "ちっ", "と"]);
+        // A run without opportunities breaks between graphemes.
+        assert_eq!(pieces("，，，，", 5), vec!["，，", "，，"]);
+    }
+
+    #[test]
+    fn code_wraps_only_after_whitespace() {
+        // Operators, negations and hyphenated words stay whole, on ASCII
+        // lines and on lines with other text alike.
+        assert_eq!(pieces("fn f() -> T", 8), vec!["fn f() ", "-> T"]);
+        assert_eq!(pieces("well-known", 7), vec!["well-kn", "own"]);
+        assert_eq!(pieces("注 a != b", 5), vec!["注 a ", "!= b"]);
+        assert_eq!(pieces("注 well-known", 8), vec!["注 ", "well-kno", "wn"]);
+    }
+
+    #[test]
+    fn graphemes_stay_whole() {
+        // A thumbs up with a skin tone modifier is one grapheme (of the
+        // modifier's columns too): it wraps whole, even past the edge.
+        assert_eq!(pieces("a👍🏽b", 2), vec!["a", "👍🏽", "b"]);
+        // A combining mark stays on its letter.
+        assert_eq!(pieces("abce\u{301}f", 4), vec!["abce\u{301}", "f"]);
+        assert_eq!(pieces("中中中e\u{301}", 6), vec!["中中中", "e\u{301}"]);
+    }
+
+    #[test]
+    fn the_indentation_alone_is_no_line() {
+        assert_eq!(pieces("    abcdefgh", 8), vec!["    abcd", "efgh"]);
+        assert_eq!(pieces("    中文字符", 8), vec!["    中文", "字符"]);
+    }
+
+    #[test]
+    fn lines_fit_unless_one_grapheme_is_wider() {
+        // A small LCG: no random-number dependency.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |n: u64| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((seed >> 33) % n) as usize
+        };
+        let alphabet = ["a", "b", " ", "-", "中", "，", "「", "👍🏽", "e\u{301}"];
+        for _ in 0..5_000 {
+            let text: String = (0..1 + next(30))
+                .map(|_| alphabet[next(alphabet.len() as u64)])
+                .collect();
+            let columns = 1 + next(12);
+            let starts = wrap_starts(&text, columns);
+            let all: Vec<usize> = text
+                .grapheme_indices(true)
+                .map(|(at, _)| at)
+                .chain([text.len()])
+                .collect();
+            for line in pieces(&text, columns) {
+                let start = line.as_ptr() as usize - text.as_ptr() as usize;
+                assert!(all.contains(&start), "{text:?} at {columns}: {starts:?}");
+                let shown = line.trim_end_matches(char::is_whitespace);
+                let width: usize = shown.chars().map(char_columns).sum();
+                assert!(
+                    width <= columns || shown.graphemes(true).count() == 1,
+                    "{text:?} at {columns}: {line:?} overflows"
+                );
+            }
+        }
     }
 
     #[test]
