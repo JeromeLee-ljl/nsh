@@ -6,7 +6,7 @@
 use std::ops::Range;
 
 use nsh_core::prelude::*;
-use unicode_segmentation::UnicodeSegmentation;
+use unicode_segmentation::GraphemeCursor;
 
 use super::controller::{Span, char_columns};
 use crate::editor::line_break::last_break;
@@ -101,41 +101,57 @@ pub(crate) fn wrap_starts(text: &str, columns: usize) -> Vec<usize> {
     // whitespace past the indentation. Other lines look for theirs when a
     // line overflows: most fit, and pay nothing for it.
     let mut break_at: Option<usize> = None;
-    for (at, grapheme) in graphemes(text, ascii) {
-        let blank = grapheme.chars().all(char::is_whitespace);
-        let width = grapheme.chars().map(char_columns).sum::<usize>();
+    // By char, not grapheme: segmenting every line that wraps costs more
+    // than the rest of wrapping it. Graphemes matter only where a line
+    // overflows.
+    for (at, c) in text.char_indices() {
+        let blank = c.is_whitespace();
+        let width = char_columns(c);
         // A line may still overflow with what moved down: wrap again. A
         // line of only zero-width chars is no use: they stay on.
         while !blank && count > 0 && count + width > columns {
+            // The grapheme `c` is in overflows: the edge is before it.
+            let edge = if ascii {
+                at
+            } else {
+                grapheme_start(text, line_start, at)
+            };
+            if edge <= line_start {
+                // One grapheme wider than the line: it stays whole.
+                break;
+            }
             let found = if ascii {
                 break_at.filter(|b| *b > line_start)
             } else {
-                last_break(text, line_start, lead, at)
+                last_break(text, line_start, lead, edge)
             };
-            let start = found.unwrap_or(at);
+            let start = found.unwrap_or(edge);
             starts.push(start);
             count = text[start..at].chars().map(char_columns).sum();
             line_start = start;
             break_at = None;
         }
         count += width;
-        if ascii && blank && at + grapheme.len() > lead {
-            break_at = Some(at + grapheme.len());
+        if ascii && blank && at + 1 > lead {
+            break_at = Some(at + 1);
         }
     }
     starts
 }
 
-/// The graphemes of `text` with their byte offsets; in ASCII text each
-/// byte is one.
-fn graphemes(text: &str, ascii: bool) -> impl Iterator<Item = (usize, &str)> {
-    let mut bytes = ascii.then(|| (0..text.len()).map(move |at| (at, &text[at..at + 1])));
-    let mut clusters = (!ascii).then(|| text.grapheme_indices(true));
-    std::iter::from_fn(move || match (&mut bytes, &mut clusters) {
-        (Some(bytes), _) => bytes.next(),
-        (_, Some(clusters)) => clusters.next(),
-        _ => None,
-    })
+/// The start of the grapheme `at` (a char's offset) is in, found from
+/// `line_start`, a grapheme's start: no further back than the line.
+fn grapheme_start(text: &str, line_start: usize, at: usize) -> usize {
+    let line = &text[line_start..];
+    let mut cursor = GraphemeCursor::new(at - line_start, line.len(), true);
+    if cursor.is_boundary(line, 0).unwrap_or(true) {
+        return at;
+    }
+    cursor
+        .prev_boundary(line, 0)
+        .ok()
+        .flatten()
+        .map_or(line_start, |offset| line_start + offset)
 }
 
 /// How many lines `text` (tabs expanded) wraps into at `columns`.
@@ -173,6 +189,8 @@ pub(crate) fn wrap_spans(spans: Vec<Span>, starts: &[usize]) -> Vec<Vec<Span>> {
 
 #[cfg(test)]
 mod tests {
+    use unicode_segmentation::UnicodeSegmentation;
+
     use super::*;
 
     fn pieces(text: &str, columns: usize) -> Vec<&str> {
@@ -281,8 +299,10 @@ mod tests {
                 .wrapping_add(1_442_695_040_888_963_407);
             ((seed >> 33) % n) as usize
         };
-        let alphabet = ["a", "b", " ", "-", "中", "，", "「", "👍🏽", "e\u{301}"];
-        for _ in 0..5_000 {
+        let alphabet = [
+            "a", "b", " ", "-", "中", "，", "「", "👍🏽", "e\u{301}", "🇨🇳", " \u{301}",
+        ];
+        for _ in 0..20_000 {
             let text: String = (0..1 + next(30))
                 .map(|_| alphabet[next(alphabet.len() as u64)])
                 .collect();
