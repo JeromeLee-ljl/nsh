@@ -104,8 +104,9 @@ pub(crate) fn wrap_starts(text: &str, columns: usize) -> Vec<usize> {
     for (at, grapheme) in graphemes(text, ascii) {
         let blank = grapheme.chars().all(char::is_whitespace);
         let width = grapheme.chars().map(char_columns).sum::<usize>();
-        // A line may still overflow with what moved down: wrap again.
-        while !blank && at > line_start && count + width > columns {
+        // A line may still overflow with what moved down: wrap again. A
+        // line of only zero-width chars is no use: they stay on.
+        while !blank && count > 0 && count + width > columns {
             let found = if ascii {
                 break_at.filter(|b| *b > line_start)
             } else {
@@ -260,6 +261,8 @@ mod tests {
         // A combining mark stays on its letter.
         assert_eq!(pieces("abce\u{301}f", 4), vec!["abce\u{301}", "f"]);
         assert_eq!(pieces("中中中e\u{301}", 6), vec!["中中中", "e\u{301}"]);
+        // A zero-width char never makes a line of its own.
+        assert_eq!(pieces("\u{200B}中文", 1), vec!["\u{200B}中", "文"]);
     }
 
     #[test]
